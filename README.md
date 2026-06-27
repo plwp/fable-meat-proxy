@@ -16,7 +16,7 @@ Gmail for their reply, and returns that reply as a normal Anthropic `Message`. A
 proxy: the model is a person.
 
 ```mermaid
-flowchart LR
+flowchart TD
     A[client.messages.create] --> B{model contains<br/>'fable'?}
     B -- no --> C[real anthropic.Anthropic] --> D[API response]
     B -- yes --> E[email prompt via Gmail API] --> F[friend pastes into Fable]
