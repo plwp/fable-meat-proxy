@@ -5,9 +5,12 @@ from __future__ import annotations
 import base64
 
 
+def b64(text: str) -> str:
+    return base64.urlsafe_b64encode(text.encode()).decode()
+
+
 def encode_part(text: str) -> dict:
-    data = base64.urlsafe_b64encode(text.encode()).decode()
-    return {"mimeType": "text/plain", "body": {"data": data}}
+    return {"mimeType": "text/plain", "body": {"data": b64(text)}}
 
 
 def make_message(msg_id: str, sender: str, text: str) -> dict:

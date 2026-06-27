@@ -1,28 +1,33 @@
+import pytest
 from conftest import FakeGmailService, make_message
 
 from fable_meat_proxy import Anthropic, Config, is_fable_model
 
 
 class FakeRealClient:
-    """Records that a real API call was made, returns a sentinel."""
+    """Records real API calls and exposes the messages surface we delegate to."""
 
     def __init__(self):
         self.calls = []
+        outer = self
 
         class _Messages:
-            def __init__(self, outer):
-                self._outer = outer
-
             def create(self, **kwargs):
-                self._outer.calls.append(kwargs)
+                outer.calls.append(kwargs)
                 return {"sentinel": "real-api", "model": kwargs.get("model")}
 
-        self.messages = _Messages(self)
+            def stream(self, **kwargs):
+                return "real-stream"
+
+            def count_tokens(self, **kwargs):
+                return "counted"
+
+        self.messages = _Messages()
         self.other_attr = "delegated"
 
 
 def _config():
-    return Config(friend_email="hank@example.com", poll_interval=0, reply_timeout=100)
+    return Config(friend_email="hank@example.com", poll_interval=0, reply_timeout_seconds=100)
 
 
 def test_is_fable_model():
@@ -40,10 +45,34 @@ def test_non_fable_passes_through_to_real_client():
     assert len(real.calls) == 1
 
 
-def test_unknown_attrs_delegate_to_real_client():
+def test_unknown_client_attrs_delegate():
     real = FakeRealClient()
     client = Anthropic(real_client=real, config=_config())
     assert client.other_attr == "delegated"
+
+
+def test_unknown_messages_attrs_delegate():
+    real = FakeRealClient()
+    client = Anthropic(real_client=real, config=_config())
+    assert client.messages.count_tokens(model="x") == "counted"
+
+
+def test_non_fable_stream_delegates():
+    real = FakeRealClient()
+    client = Anthropic(real_client=real, config=_config())
+    assert client.messages.stream(model="claude-opus-4-8") == "real-stream"
+
+
+def test_fable_stream_rejected():
+    client = Anthropic(real_client=FakeRealClient(), config=_config())
+    with pytest.raises(NotImplementedError):
+        client.messages.stream(model="claude-fable-5", messages=[])
+
+
+def test_fable_create_stream_true_rejected():
+    client = Anthropic(real_client=FakeRealClient(), config=_config())
+    with pytest.raises(NotImplementedError):
+        client.messages.create(model="claude-fable-5", stream=True, messages=[])
 
 
 def test_fable_routes_to_meat_and_returns_message():

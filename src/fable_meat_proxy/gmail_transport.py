@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import logging
 import os
 import time
 from email.mime.text import MIMEText
 
+from .errors import FableReplyTimeout
+from .parsing import extract_message_text, strip_quoted_reply
+
+logger = logging.getLogger("fable_meat_proxy")
+
 # gmail.modify covers both send and read of the authenticated account.
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+
+_TRANSIENT_HTTP_STATUS = {429, 500, 502, 503, 504}
 
 
 def build_service(config):
@@ -25,6 +34,7 @@ def build_service(config):
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
+            logger.info("Refreshing expired Gmail credentials")
             creds.refresh(Request())
         else:
             if not os.path.exists(config.credentials_path):
@@ -32,12 +42,45 @@ def build_service(config):
                     f"Gmail OAuth client secret not found at {config.credentials_path!r}. "
                     "Download a Desktop-app OAuth client from Google Cloud Console."
                 )
+            logger.info("Running Gmail OAuth flow")
             flow = InstalledAppFlow.from_client_secrets_file(config.credentials_path, SCOPES)
             creds = flow.run_local_server(port=0)
         with open(config.token_path, "w") as fh:
             fh.write(creds.to_json())
 
     return build("gmail", "v1", credentials=creds)
+
+
+def _is_transient(exc: Exception) -> bool:
+    """Whether a Gmail call failure is worth retrying."""
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    if status is not None:
+        try:
+            return int(status) in _TRANSIENT_HTTP_STATUS
+        except (TypeError, ValueError):
+            return False
+    return isinstance(exc, (TimeoutError, ConnectionError, OSError))
+
+
+def execute_with_retry(thunk, *, retries: int = 4, base_delay: float = 1.0, sleep=time.sleep):
+    """Run ``thunk`` (a Gmail request `.execute()`), retrying transient errors."""
+    attempt = 0
+    while True:
+        try:
+            return thunk()
+        except Exception as exc:  # noqa: BLE001 - we re-raise non-transient below
+            attempt += 1
+            if attempt > retries or not _is_transient(exc):
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.warning(
+                "Transient Gmail error (attempt %d/%d): %s; retrying in %.1fs",
+                attempt,
+                retries,
+                exc,
+                delay,
+            )
+            sleep(delay)
 
 
 def send_message(service, to: str, subject: str, body: str, sender: str = "me") -> dict:
@@ -47,20 +90,16 @@ def send_message(service, to: str, subject: str, body: str, sender: str = "me") 
     msg["from"] = sender
     msg["subject"] = subject
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-    return (
-        service.users()
-        .messages()
-        .send(userId="me", body={"raw": raw})
-        .execute()
+    result = execute_with_retry(
+        lambda: service.users().messages().send(userId="me", body={"raw": raw}).execute()
     )
+    logger.info("Sent Fable prompt to %s (thread %s)", to, result.get("threadId"))
+    return result
 
 
 def get_thread_messages(service, thread_id: str) -> list[dict]:
-    thread = (
-        service.users()
-        .threads()
-        .get(userId="me", id=thread_id, format="full")
-        .execute()
+    thread = execute_with_retry(
+        lambda: service.users().threads().get(userId="me", id=thread_id, format="full").execute()
     )
     return thread.get("messages", [])
 
@@ -73,33 +112,20 @@ def get_header(message: dict, name: str) -> str:
     return ""
 
 
-def _decode(data: str) -> str:
-    return base64.urlsafe_b64decode(data.encode()).decode("utf-8", errors="replace")
+def find_reply(messages: list[dict], exclude_id: str | None, friend_email: str) -> str | None:
+    """Return the friend's reply text from a thread, or None if not present yet."""
+    for message in messages:
+        if message.get("id") == exclude_id:
+            continue
+        if friend_email.lower() in get_header(message, "From").lower():
+            return strip_quoted_reply(extract_message_text(message))
+    return None
 
 
-def extract_message_text(message: dict) -> str:
-    """Pull the text/plain body out of a Gmail message payload."""
-    return _walk_parts(message.get("payload", {}))
-
-
-def _walk_parts(payload: dict) -> str:
-    mime = payload.get("mimeType", "")
-    data = payload.get("body", {}).get("data")
-    if mime == "text/plain" and data:
-        return _decode(data)
-    parts = payload.get("parts") or []
-    for part in parts:  # prefer text/plain anywhere in the tree
-        if part.get("mimeType") == "text/plain":
-            text = _walk_parts(part)
-            if text:
-                return text
-    for part in parts:  # fall back to the first part that yields anything
-        text = _walk_parts(part)
-        if text:
-            return text
-    if data:
-        return _decode(data)
-    return ""
+def _timeout_error(friend_email: str, thread_id: str) -> FableReplyTimeout:
+    return FableReplyTimeout(
+        f"No Fable reply from {friend_email} before the deadline (thread {thread_id})."
+    )
 
 
 def wait_for_reply(
@@ -108,23 +134,42 @@ def wait_for_reply(
     *,
     exclude_id: str | None,
     friend_email: str,
-    timeout: float,
+    deadline_ts: float,
     poll_interval: float,
     sleep=time.sleep,
-    clock=time.monotonic,
+    now=time.time,
 ) -> str:
     """Block until the friend replies in the thread, then return their text."""
-    from .parsing import strip_quoted_reply
-
-    deadline = clock() + timeout
     while True:
-        for message in get_thread_messages(service, thread_id):
-            if message.get("id") == exclude_id:
-                continue
-            if friend_email.lower() in get_header(message, "From").lower():
-                return strip_quoted_reply(extract_message_text(message))
-        if clock() >= deadline:
-            raise TimeoutError(
-                f"No Fable reply from {friend_email} within {timeout}s (thread {thread_id})."
-            )
+        text = find_reply(get_thread_messages(service, thread_id), exclude_id, friend_email)
+        if text is not None:
+            logger.info("Received Fable reply on thread %s", thread_id)
+            return text
+        if now() >= deadline_ts:
+            raise _timeout_error(friend_email, thread_id)
+        logger.debug("No reply yet on thread %s; sleeping %.0fs", thread_id, poll_interval)
         sleep(poll_interval)
+
+
+async def wait_for_reply_async(
+    service,
+    thread_id: str,
+    *,
+    exclude_id: str | None,
+    friend_email: str,
+    deadline_ts: float,
+    poll_interval: float,
+    sleep=asyncio.sleep,
+    now=time.time,
+) -> str:
+    """Async variant of :func:`wait_for_reply`; blocking Gmail calls run in a thread."""
+    while True:
+        messages = await asyncio.to_thread(get_thread_messages, service, thread_id)
+        text = find_reply(messages, exclude_id, friend_email)
+        if text is not None:
+            logger.info("Received Fable reply on thread %s", thread_id)
+            return text
+        if now() >= deadline_ts:
+            raise _timeout_error(friend_email, thread_id)
+        logger.debug("No reply yet on thread %s; sleeping %.0fs", thread_id, poll_interval)
+        await sleep(poll_interval)

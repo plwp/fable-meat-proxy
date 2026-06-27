@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import html as _html
 import re
 
 
@@ -15,10 +17,15 @@ def _content_to_text(content) -> str:
     if isinstance(content, list):
         for block in content:
             if isinstance(block, dict):
-                if block.get("type") == "text":
+                btype = block.get("type")
+                if btype == "text":
                     parts.append(block.get("text", ""))
+                elif btype == "tool_use":
+                    parts.append(f"[tool_use {block.get('name', '')}: {block.get('input', {})}]")
+                elif btype == "tool_result":
+                    parts.append(f"[tool_result: {_content_to_text(block.get('content'))}]")
                 else:
-                    parts.append(f"[{block.get('type', 'block')}]")
+                    parts.append(f"[{btype or 'block'}]")
             else:
                 text = getattr(block, "text", None)
                 parts.append(text if text is not None else str(block))
@@ -76,6 +83,45 @@ def format_prompt_email(*, model, messages, system=None, max_tokens=None, corr_i
         lines.append("")
     lines.append("===== END OF PROMPT — reply with Fable's answer above the quote =====")
     return "\n".join(lines)
+
+
+def _decode_b64url(data: str) -> str:
+    return base64.urlsafe_b64decode(data.encode()).decode("utf-8", errors="replace")
+
+
+def _collect_text_parts(payload: dict, out: dict[str, str]) -> None:
+    mime = payload.get("mimeType", "")
+    data = payload.get("body", {}).get("data")
+    if data and mime.startswith("text/"):
+        out.setdefault(mime, _decode_b64url(data))
+    for part in payload.get("parts") or []:
+        _collect_text_parts(part, out)
+
+
+def extract_message_text(message: dict) -> str:
+    """Pull the best plain-text representation out of a Gmail message payload.
+
+    Prefers ``text/plain``; falls back to ``text/html`` (de-tagged) and then to
+    any text part present.
+    """
+    parts: dict[str, str] = {}
+    _collect_text_parts(message.get("payload", {}), parts)
+    if "text/plain" in parts:
+        return parts["text/plain"]
+    if "text/html" in parts:
+        return html_to_text(parts["text/html"])
+    return next(iter(parts.values()), "")
+
+
+def html_to_text(source: str) -> str:
+    """Best-effort conversion of an HTML email body to plain text."""
+    source = re.sub(r"(?is)<(script|style).*?</\1>", "", source)
+    source = re.sub(r"(?i)<br\s*/?>", "\n", source)
+    source = re.sub(r"(?i)</(p|div|li|tr|h[1-6])>", "\n", source)
+    source = re.sub(r"<[^>]+>", "", source)
+    text = _html.unescape(source)
+    # Collapse runs of blank lines left behind by stripped markup.
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 _REPLY_MARKERS = (
