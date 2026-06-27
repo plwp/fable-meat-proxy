@@ -56,7 +56,22 @@ def first_user_snippet(messages, limit: int = 60) -> str:
     return "(no prompt)"
 
 
-def format_prompt_email(*, model, messages, system=None, max_tokens=None, corr_id) -> str:
+# Generation parameters worth surfacing to the human so they aren't silently lost.
+NOTABLE_PARAMS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "stop_sequences",
+    "tools",
+    "tool_choice",
+    "thinking",
+    "metadata",
+)
+
+
+def format_prompt_email(
+    *, model, messages, system=None, max_tokens=None, corr_id, extra_params=None
+) -> str:
     """Build the human-readable email body the friend pastes into Fable."""
     lines: list[str] = [
         "You are serving as a human proxy for the Fable model. 🥩",
@@ -81,11 +96,22 @@ def format_prompt_email(*, model, messages, system=None, max_tokens=None, corr_i
         lines.append(f"--- {_role_of(message)} ---")
         lines.append(_content_to_text(_content_of(message)))
         lines.append("")
+
+    shown = {
+        k: v for k, v in (extra_params or {}).items() if k in NOTABLE_PARAMS and v is not None
+    }
+    if shown:
+        lines.append("===== REQUEST PARAMETERS (best-effort; honour where you can) =====")
+        lines += [f"{k}: {v}" for k, v in shown.items()]
+        lines.append("")
+
     lines.append("===== END OF PROMPT — reply with Fable's answer above the quote =====")
     return "\n".join(lines)
 
 
 def _decode_b64url(data: str) -> str:
+    # Gmail may return base64url without padding; restore it before decoding.
+    data += "=" * (-len(data) % 4)
     return base64.urlsafe_b64decode(data.encode()).decode("utf-8", errors="replace")
 
 
@@ -124,22 +150,22 @@ def html_to_text(source: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+# Boundaries that introduce a quoted original. We break at the first one and keep
+# everything above it. We deliberately do NOT strip lone ">" lines before a marker,
+# so legitimate Markdown blockquotes in Fable's answer survive. The bare "From:"
+# header marker is omitted on purpose — it false-positives on real answer text.
 _REPLY_MARKERS = (
     re.compile(r"^On .*wrote:\s*$"),
     re.compile(r"^-{2,}\s*Original Message\s*-{2,}", re.IGNORECASE),
     re.compile(r"^_{5,}\s*$"),
-    re.compile(r"^From:\s.+", re.IGNORECASE),
 )
 
 
 def strip_quoted_reply(body: str) -> str:
-    """Drop quoted original text and trailing reply chrome from an email body."""
+    """Drop the quoted original (and everything after it) from an email body."""
     out: list[str] = []
     for line in body.splitlines():
-        stripped = line.strip()
-        if any(marker.match(stripped) for marker in _REPLY_MARKERS):
+        if any(marker.match(line.strip()) for marker in _REPLY_MARKERS):
             break
-        if stripped.startswith(">"):
-            continue
         out.append(line)
     return "\n".join(out).strip()

@@ -11,6 +11,32 @@ _STREAM_MSG = (
     "Streaming is not supported for the Fable meat proxy — a human reply arrives "
     "all at once. Use messages.create() without stream=True for Fable models."
 )
+_RAW_MSG = (
+    "Fable routing is not available via with_raw_response / with_streaming_response "
+    "(they return wire-level responses a human reply can't satisfy). Use "
+    "messages.create() for Fable models."
+)
+
+
+class _RoutedResponseProxy:
+    """Wraps messages.with_raw_response / with_streaming_response.
+
+    Non-Fable calls delegate to the real wrapper; Fable calls raise rather than
+    silently bypassing the meat proxy and hitting the real API.
+    """
+
+    def __init__(self, real_wrapper):
+        self._real = real_wrapper
+
+    def create(self, **kwargs):
+        if is_fable_model(kwargs.get("model")):
+            raise NotImplementedError(_RAW_MSG)
+        return self._real.create(**kwargs)
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._real, name)
 
 
 class _Messages:
@@ -31,9 +57,17 @@ class _Messages:
             raise NotImplementedError(_STREAM_MSG)
         return self._proxy._real.messages.stream(**kwargs)
 
+    @property
+    def with_raw_response(self):
+        return _RoutedResponseProxy(self._proxy._real.messages.with_raw_response)
+
+    @property
+    def with_streaming_response(self):
+        return _RoutedResponseProxy(self._proxy._real.messages.with_streaming_response)
+
     def __getattr__(self, name):
-        # count_tokens, batches, with_raw_response, … fall through to the real
-        # messages resource. (Fable routing only applies to create()/stream().)
+        # count_tokens, batches, … fall through to the real messages resource.
+        # (Fable routing only applies to create()/stream() and the response wrappers.)
         if name.startswith("_"):
             raise AttributeError(name)
         return getattr(self._proxy._real.messages, name)
@@ -55,6 +89,14 @@ class _AsyncMessages:
             raise NotImplementedError(_STREAM_MSG)
         return self._proxy._real.messages.stream(**kwargs)
 
+    @property
+    def with_raw_response(self):
+        return _RoutedResponseProxy(self._proxy._real.messages.with_raw_response)
+
+    @property
+    def with_streaming_response(self):
+        return _RoutedResponseProxy(self._proxy._real.messages.with_streaming_response)
+
     def __getattr__(self, name):
         if name.startswith("_"):
             raise AttributeError(name)
@@ -65,11 +107,20 @@ class _BaseProxy:
     _real: object
 
     def __getattr__(self, name):
-        # Anything we don't override (.models, .beta, .with_options, …) falls
-        # through to the real client. Guard against recursion before _real is set.
+        # Anything we don't override (.models, .beta, …) falls through to the real
+        # client. Guard against recursion before _real is set.
         if name.startswith("_"):
             raise AttributeError(name)
         return getattr(self._real, name)
+
+    def with_options(self, **kwargs):
+        # The real with_options() returns a fresh real client; re-wrap it so Fable
+        # routing survives chaining (client.with_options(...).messages.create(...)).
+        return type(self)(
+            real_client=self._real.with_options(**kwargs),
+            config=self._config,
+            gmail_service=self._gmail_service,
+        )
 
 
 class Anthropic(_BaseProxy):
@@ -129,6 +180,9 @@ class AsyncAnthropic(_BaseProxy):
             self._real = _RealAsyncAnthropic(*args, **kwargs)
         self._config = config
         self._gmail_service = gmail_service
+        # Serializes access to the shared, not-thread-safe Gmail service across
+        # concurrent Fable requests.
+        self._gmail_lock = asyncio.Lock()
         self.messages = _AsyncMessages(self)
 
     async def _complete_via_meat(self, **kwargs):
@@ -137,4 +191,6 @@ class AsyncAnthropic(_BaseProxy):
             from .gmail_transport import build_service
 
             self._gmail_service = await asyncio.to_thread(build_service, config)
-        return await complete_via_meat_async(config, self._gmail_service, **kwargs)
+        return await complete_via_meat_async(
+            config, self._gmail_service, lock=self._gmail_lock, **kwargs
+        )

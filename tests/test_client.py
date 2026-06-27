@@ -4,14 +4,27 @@ from conftest import FakeGmailService, make_message
 from fable_meat_proxy import Anthropic, Config, is_fable_model
 
 
+class FakeRawResponse:
+    def __init__(self, outer):
+        self._outer = outer
+
+    def create(self, **kwargs):
+        self._outer.calls.append(("raw", kwargs))
+        return {"sentinel": "raw"}
+
+
 class FakeRealClient:
     """Records real API calls and exposes the messages surface we delegate to."""
 
     def __init__(self):
         self.calls = []
+        self.options = None
         outer = self
 
         class _Messages:
+            with_raw_response = FakeRawResponse(outer)
+            with_streaming_response = FakeRawResponse(outer)
+
             def create(self, **kwargs):
                 outer.calls.append(kwargs)
                 return {"sentinel": "real-api", "model": kwargs.get("model")}
@@ -24,6 +37,10 @@ class FakeRealClient:
 
         self.messages = _Messages()
         self.other_attr = "delegated"
+
+    def with_options(self, **kwargs):
+        self.options = kwargs
+        return self
 
 
 def _config():
@@ -73,6 +90,33 @@ def test_fable_create_stream_true_rejected():
     client = Anthropic(real_client=FakeRealClient(), config=_config())
     with pytest.raises(NotImplementedError):
         client.messages.create(model="claude-fable-5", stream=True, messages=[])
+
+
+def test_with_options_preserves_proxy_and_routing():
+    own = make_message("sent-1", "Me <me@example.com>", "prompt")
+    reply = make_message("r1", "Hank <hank@example.com>", "options answer")
+    service = FakeGmailService([[own], [own, reply]])
+    real = FakeRealClient()
+    client = Anthropic(real_client=real, config=_config(), gmail_service=service)
+
+    scoped = client.with_options(timeout=5)
+    assert isinstance(scoped, Anthropic)
+    assert real.options == {"timeout": 5}
+
+    # Fable routing must survive the with_options() chaining.
+    msg = scoped.messages.create(
+        model="claude-fable-5", messages=[{"role": "user", "content": "hi"}]
+    )
+    assert msg.content[0].text == "options answer"
+    assert real.calls == []
+
+
+def test_raw_response_rejects_fable_but_delegates_others():
+    real = FakeRealClient()
+    client = Anthropic(real_client=real, config=_config())
+    with pytest.raises(NotImplementedError):
+        client.messages.with_raw_response.create(model="claude-fable-5", messages=[])
+    assert client.messages.with_raw_response.create(model="claude-opus-4-8")["sentinel"] == "raw"
 
 
 def test_fable_routes_to_meat_and_returns_message():

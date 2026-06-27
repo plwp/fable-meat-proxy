@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed (code-review hardening)
+- `with_options(...)` now returns a proxy, so Fable routing survives chaining;
+  `with_raw_response` / `with_streaming_response` reject Fable instead of silently
+  hitting the real API.
+- Reply matching uses exact parsed addresses and returns the latest reply
+  (no substring/display-name false positives, no stale earliest reply).
+- Request parameters (`temperature`, `tools`, `stop_sequences`, …) are surfaced in
+  the email instead of being silently dropped.
+- Async Gmail access is serialized with a lock (the googleapiclient service is not
+  thread-safe under concurrent requests).
+- Poll sleep is bounded by the remaining time so the deadline isn't overshot.
+- base64url reply bodies are padded before decoding; quote-stripping preserves
+  Markdown blockquotes and no longer treats `From:` lines as quote boundaries.
+- Least-privilege Gmail scopes (`gmail.send` + `gmail.readonly`); `token.json`
+  written `0600`; bogus `From: me` header omitted.
+
 ## [0.1.0] - 2026-06-28
 
 ### Added

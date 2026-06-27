@@ -8,14 +8,18 @@ import logging
 import os
 import time
 from email.mime.text import MIMEText
+from email.utils import parseaddr
 
 from .errors import FableReplyTimeout
 from .parsing import extract_message_text, strip_quoted_reply
 
 logger = logging.getLogger("fable_meat_proxy")
 
-# gmail.modify covers both send and read of the authenticated account.
-SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+# Least privilege: send mail + read the reply thread. No modify/label/delete.
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.readonly",
+]
 
 _TRANSIENT_HTTP_STATUS = {429, 500, 502, 503, 504}
 
@@ -47,6 +51,11 @@ def build_service(config):
             creds = flow.run_local_server(port=0)
         with open(config.token_path, "w") as fh:
             fh.write(creds.to_json())
+        # token.json is a secret (refresh token); keep it owner-only.
+        try:
+            os.chmod(config.token_path, 0o600)
+        except OSError:  # pragma: no cover - non-POSIX filesystems
+            logger.warning("Could not restrict permissions on %s", config.token_path)
 
     return build("gmail", "v1", credentials=creds)
 
@@ -87,7 +96,9 @@ def send_message(service, to: str, subject: str, body: str, sender: str = "me") 
     """Send a plain-text email; returns the sent message resource (with threadId)."""
     msg = MIMEText(body)
     msg["to"] = to
-    msg["from"] = sender
+    # "me" is a Gmail API placeholder, not a valid address — let Gmail fill From.
+    if sender and sender != "me":
+        msg["from"] = sender
     msg["subject"] = subject
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     result = execute_with_retry(
@@ -113,19 +124,33 @@ def get_header(message: dict, name: str) -> str:
 
 
 def find_reply(messages: list[dict], exclude_id: str | None, friend_email: str) -> str | None:
-    """Return the friend's reply text from a thread, or None if not present yet."""
+    """Return the friend's latest reply text from a thread, or None if none yet.
+
+    Matches the friend by *exact* parsed address (display names and substrings do
+    not count) and returns the most recent qualifying message, since Gmail returns
+    thread messages in chronological order.
+    """
+    target = friend_email.strip().lower()
+    latest = None
     for message in messages:
         if message.get("id") == exclude_id:
             continue
-        if friend_email.lower() in get_header(message, "From").lower():
-            return strip_quoted_reply(extract_message_text(message))
-    return None
+        if parseaddr(get_header(message, "From"))[1].lower() == target:
+            latest = message
+    if latest is None:
+        return None
+    return strip_quoted_reply(extract_message_text(latest))
 
 
 def _timeout_error(friend_email: str, thread_id: str) -> FableReplyTimeout:
     return FableReplyTimeout(
         f"No Fable reply from {friend_email} before the deadline (thread {thread_id})."
     )
+
+
+def _next_sleep(poll_interval: float, deadline_ts: float, now_ts: float) -> float:
+    """Sleep no longer than the remaining time so we never overshoot the deadline."""
+    return min(poll_interval, max(0.0, deadline_ts - now_ts))
 
 
 def wait_for_reply(
@@ -145,10 +170,11 @@ def wait_for_reply(
         if text is not None:
             logger.info("Received Fable reply on thread %s", thread_id)
             return text
-        if now() >= deadline_ts:
+        now_ts = now()
+        if now_ts >= deadline_ts:
             raise _timeout_error(friend_email, thread_id)
-        logger.debug("No reply yet on thread %s; sleeping %.0fs", thread_id, poll_interval)
-        sleep(poll_interval)
+        logger.debug("No reply yet on thread %s; polling again", thread_id)
+        sleep(_next_sleep(poll_interval, deadline_ts, now_ts))
 
 
 async def wait_for_reply_async(
@@ -161,15 +187,27 @@ async def wait_for_reply_async(
     poll_interval: float,
     sleep=asyncio.sleep,
     now=time.time,
+    lock=None,
 ) -> str:
-    """Async variant of :func:`wait_for_reply`; blocking Gmail calls run in a thread."""
+    """Async variant of :func:`wait_for_reply`; blocking Gmail calls run in a thread.
+
+    ``lock`` (an ``asyncio.Lock``) serializes access to the shared, not-thread-safe
+    googleapiclient service when multiple Fable requests run concurrently.
+    """
+
+    async def _poll():
+        if lock is None:
+            return await asyncio.to_thread(get_thread_messages, service, thread_id)
+        async with lock:
+            return await asyncio.to_thread(get_thread_messages, service, thread_id)
+
     while True:
-        messages = await asyncio.to_thread(get_thread_messages, service, thread_id)
-        text = find_reply(messages, exclude_id, friend_email)
+        text = find_reply(await _poll(), exclude_id, friend_email)
         if text is not None:
             logger.info("Received Fable reply on thread %s", thread_id)
             return text
-        if now() >= deadline_ts:
+        now_ts = now()
+        if now_ts >= deadline_ts:
             raise _timeout_error(friend_email, thread_id)
-        logger.debug("No reply yet on thread %s; sleeping %.0fs", thread_id, poll_interval)
-        await sleep(poll_interval)
+        logger.debug("No reply yet on thread %s; polling again", thread_id)
+        await sleep(_next_sleep(poll_interval, deadline_ts, now_ts))

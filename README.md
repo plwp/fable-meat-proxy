@@ -54,7 +54,9 @@ Copy `.env.example` to `.env` and fill it in:
    fable-meat-auth
    ```
 
-The scope used is `gmail.modify` (send + read of your own account).
+Least-privilege scopes are requested: `gmail.send` + `gmail.readonly` (send the
+prompt, read the reply thread — no modify/label/delete). The minted `token.json`
+holds a refresh token, so it's a **secret**: it's written `0600` and gitignored.
 
 ## Use
 

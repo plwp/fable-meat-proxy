@@ -33,6 +33,18 @@ def test_find_reply_skips_own_message():
     assert "hank@example.com" in get_header(reply, "From")
 
 
+def test_find_reply_requires_exact_address_not_substring():
+    # An impostor whose address merely contains the friend's address must not match.
+    impostor = make_message("x", "hank@example.com.attacker.test", "malicious")
+    assert find_reply([impostor], "sent-1", "hank@example.com") is None
+
+
+def test_find_reply_returns_latest_friend_message():
+    first = make_message("a", "Hank <hank@example.com>", "first draft")
+    second = make_message("b", "Hank <hank@example.com>", "final answer")
+    assert find_reply([first, second], "sent-1", "hank@example.com") == "final answer"
+
+
 def test_wait_for_reply_returns_friend_reply_after_polling():
     own = make_message("sent-1", "Me <me@example.com>", "the prompt")
     reply = make_message("r1", "Hank <hank@example.com>", "Fable says hi")
@@ -70,6 +82,26 @@ def test_wait_for_reply_times_out():
             now=lambda: next(nows),
         )
     assert isinstance(exc.value, TimeoutError)
+
+
+def test_wait_for_reply_sleep_bounded_by_deadline():
+    own = make_message("sent-1", "Me <me@example.com>", "the prompt")
+    service = FakeGmailService([[own]])
+    nows = iter([5.0, 12.0])
+    sleeps = []
+
+    with pytest.raises(FableReplyTimeout):
+        wait_for_reply(
+            service,
+            "thread-1",
+            exclude_id="sent-1",
+            friend_email="hank@example.com",
+            deadline_ts=10.0,
+            poll_interval=100.0,  # far larger than the remaining 5s
+            sleep=lambda s: sleeps.append(s),
+            now=lambda: next(nows),
+        )
+    assert sleeps == [5.0]  # min(poll_interval, deadline - now)
 
 
 def test_retry_transient_then_success():

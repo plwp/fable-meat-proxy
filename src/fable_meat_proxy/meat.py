@@ -49,12 +49,17 @@ def build_message(model: str, text: str, corr: str, *, input_tokens: int = 0, ou
         )
 
 
-def _prepare(config: Config, model, messages, system, max_tokens, corr_id, now_ts):
+def _prepare(config: Config, model, messages, system, max_tokens, corr_id, now_ts, extra_params):
     """Shared setup for the sync and async paths."""
     corr = corr_id or uuid.uuid4().hex[:8]
     subject = f"[{config.subject_prefix} {corr}] {first_user_snippet(messages)}"
     body = format_prompt_email(
-        model=model, messages=messages, system=system, max_tokens=max_tokens, corr_id=corr
+        model=model,
+        messages=messages,
+        system=system,
+        max_tokens=max_tokens,
+        corr_id=corr,
+        extra_params=extra_params,
     )
     deadline_ts = deadline_ts_from_config(config, now_ts)
     logger.info("Routing model %r to meat proxy (corr %s)", model, corr)
@@ -72,11 +77,11 @@ def complete_via_meat(
     corr_id: str | None = None,
     sleep=time.sleep,
     now=time.time,
-    **_ignored,
+    **extra_params,
 ):
     """Email the prompt to the friend, block for their reply, return a Message."""
     corr, subject, body, deadline_ts = _prepare(
-        config, model, messages, system, max_tokens, corr_id, now()
+        config, model, messages, system, max_tokens, corr_id, now(), extra_params
     )
     sent = send_message(service, config.friend_email, subject, body, sender=config.sender_email)
     reply = wait_for_reply(
@@ -103,15 +108,22 @@ async def complete_via_meat_async(
     corr_id: str | None = None,
     sleep=asyncio.sleep,
     now=time.time,
-    **_ignored,
+    lock=None,
+    **extra_params,
 ):
     """Async variant of :func:`complete_via_meat`."""
     corr, subject, body, deadline_ts = _prepare(
-        config, model, messages, system, max_tokens, corr_id, now()
+        config, model, messages, system, max_tokens, corr_id, now(), extra_params
     )
-    sent = await asyncio.to_thread(
-        send_message, service, config.friend_email, subject, body, config.sender_email
-    )
+    if lock is not None:
+        async with lock:
+            sent = await asyncio.to_thread(
+                send_message, service, config.friend_email, subject, body, config.sender_email
+            )
+    else:
+        sent = await asyncio.to_thread(
+            send_message, service, config.friend_email, subject, body, config.sender_email
+        )
     reply = await wait_for_reply_async(
         service,
         sent["threadId"],
@@ -121,5 +133,6 @@ async def complete_via_meat_async(
         poll_interval=config.poll_interval,
         sleep=sleep,
         now=now,
+        lock=lock,
     )
     return build_message(model, reply, corr)

@@ -72,6 +72,30 @@ def test_strip_quoted_reply_handles_no_quote():
     assert strip_quoted_reply("just the answer") == "just the answer"
 
 
+def test_strip_quoted_reply_preserves_markdown_blockquotes():
+    raw = "> a Fable blockquote\nregular line\n\nOn Mon wrote:\n> the original\n"
+    assert strip_quoted_reply(raw) == "> a Fable blockquote\nregular line"
+
+
+def test_strip_quoted_reply_keeps_from_lines_in_body():
+    # A bare "From:" line is real answer text, not a quote boundary.
+    assert strip_quoted_reply("From: the desk of Fable\nanswer") == (
+        "From: the desk of Fable\nanswer"
+    )
+
+
+def test_format_prompt_email_renders_request_parameters():
+    body = format_prompt_email(
+        model="claude-fable-5",
+        messages=[],
+        corr_id="x",
+        extra_params={"temperature": 0.7, "stop_sequences": ["STOP"], "stream": True},
+    )
+    assert "temperature: 0.7" in body
+    assert "stop_sequences: ['STOP']" in body
+    assert "stream" not in body  # not a notable generation param
+
+
 def test_extract_message_text_plain():
     assert extract_message_text(make_message("m1", "x@y", "hello world")) == "hello world"
 
@@ -97,6 +121,15 @@ def test_extract_message_text_html_fallback():
         }
     }
     assert extract_message_text(msg) == "only\nhtml"
+
+
+def test_extract_message_text_unpadded_base64():
+    # Gmail can return base64url without "=" padding; decoding must still work.
+    import base64 as _b64
+
+    data = _b64.urlsafe_b64encode(b"hello!").decode().rstrip("=")
+    msg = {"payload": {"mimeType": "text/plain", "body": {"data": data}}}
+    assert extract_message_text(msg) == "hello!"
 
 
 def test_html_to_text_strips_tags_and_scripts():
