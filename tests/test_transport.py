@@ -104,6 +104,27 @@ def test_ensure_owner_only_tightens_group_world_readable(tmp_path):
     assert (os.stat(path).st_mode & 0o077) == 0
 
 
+def test_write_secret_file_refuses_to_follow_symlink(tmp_path):
+    victim = tmp_path / "victim"
+    victim.write_text("important")
+    link = tmp_path / "token.json"
+    os.symlink(victim, link)
+    with pytest.raises(OSError):  # O_NOFOLLOW -> ELOOP, write is refused
+        write_secret_file(str(link), "credentials")
+    assert victim.read_text() == "important"  # untouched
+
+
+def test_ensure_owner_only_refuses_symlink(tmp_path):
+    victim = tmp_path / "victim"
+    victim.write_text("important")
+    os.chmod(victim, 0o644)
+    link = tmp_path / "token.json"
+    os.symlink(victim, link)
+    _ensure_owner_only(str(link))
+    # The symlink target's perms must be left alone, not tightened through the link.
+    assert (os.stat(victim).st_mode & 0o077) != 0
+
+
 def test_wait_for_reply_returns_friend_reply_after_polling():
     own = make_message("sent-1", "Me <me@example.com>", "the prompt")
     reply = make_message("r1", "Hank <hank@example.com>", "Fable says hi")

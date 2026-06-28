@@ -6,6 +6,7 @@ import asyncio
 import base64
 import logging
 import os
+import stat
 import time
 from email.mime.text import MIMEText
 from email.utils import parseaddr
@@ -58,37 +59,60 @@ def build_service(config):
     return build("gmail", "v1", credentials=creds)
 
 
+# O_NOFOLLOW makes open() refuse a symlink at the final path component, so a
+# pre-placed "token.json -> victim" symlink can't redirect our write or chmod.
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
 def _ensure_owner_only(path: str) -> None:
-    """Tighten a secret file to 0600 if it is group/other-accessible."""
+    """Tighten a secret file to 0600 if it is group/other-accessible.
+
+    Refuses to operate through a symlink (uses ``lstat`` to detect it and a
+    NOFOLLOW open to ``fchmod`` the real file) so a swapped symlink can't be used
+    to change a victim file's permissions.
+    """
     try:
-        mode = os.stat(path).st_mode
+        st = os.lstat(path)
     except OSError:  # pragma: no cover - file vanished between checks
         return
-    if mode & 0o077:
+    if stat.S_ISLNK(st.st_mode):
+        logger.warning("Refusing to trust token file %s: it is a symlink.", path)
+        return
+    if st.st_mode & 0o077:
         logger.warning(
             "Secret file %s was group/other-accessible (mode %o); tightening to 0600.",
             path,
-            mode & 0o777,
+            st.st_mode & 0o777,
         )
         try:
-            os.chmod(path, 0o600)
+            fd = os.open(path, os.O_RDONLY | _NOFOLLOW)
+        except OSError:  # pragma: no cover - replaced by a symlink between checks
+            logger.warning("Could not reopen %s to restrict permissions", path)
+            return
+        try:
+            os.fchmod(fd, 0o600)
         except OSError:  # pragma: no cover - non-POSIX filesystems
             logger.warning("Could not restrict permissions on %s", path)
+        finally:
+            os.close(fd)
 
 
 def write_secret_file(path: str, data: str) -> None:
-    """Write ``data`` with owner-only permissions, created atomically at 0600."""
-    # O_CREAT applies 0o600 only on creation; the chmod afterwards also covers a
-    # pre-existing file, whose perms O_CREAT would have left untouched.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write(data)
-    finally:
+    """Write ``data`` with owner-only permissions, created atomically at 0600.
+
+    Uses O_NOFOLLOW so a pre-existing symlink at ``path`` is not followed, and
+    fchmod (on the open descriptor, not the path) so the perm change can't be
+    raced onto another file.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        # O_CREAT applies 0o600 only on creation; fchmod also covers a pre-existing
+        # regular file, whose perms O_CREAT would have left untouched.
         try:
-            os.chmod(path, 0o600)
+            os.fchmod(fh.fileno(), 0o600)
         except OSError:  # pragma: no cover - non-POSIX filesystems
             logger.warning("Could not restrict permissions on %s", path)
+        fh.write(data)
 
 
 def _is_transient(exc: Exception) -> bool:

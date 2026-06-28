@@ -28,6 +28,16 @@ All notable changes to this project are documented here. The format is based on
 - **Poll-interval floor.** `Config.from_env()` clamps `FABLE_POLL_INTERVAL` below
   5 s to avoid busy-polling Gmail (direct `Config(...)` still allows 0 for tests).
 
+#### Follow-up (second red-team pass)
+- **`client.beta` no longer bypasses Fable routing.** `beta.messages.create` /
+  `stream` / `count_tokens` reject Fable models instead of reaching the real API.
+- **Token file is symlink-safe.** Writes use `O_NOFOLLOW` and `fchmod` on the open
+  descriptor; `_ensure_owner_only` refuses symlinks — closing the symlink/TOCTOU
+  vector on `token.json`.
+- **Caller-supplied `reply_token`/`corr_id` are stripped** in the client path, so a
+  weak or predictable token can't be injected through `messages.create` kwargs.
+- **`with_raw_response.count_tokens`** also rejects Fable models.
+
 ### Changed (code-review hardening)
 - `with_options(...)` now returns a proxy, so Fable routing survives chaining;
   `with_raw_response` / `with_streaming_response` reject Fable instead of silently

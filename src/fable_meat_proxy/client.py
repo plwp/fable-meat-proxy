@@ -21,6 +21,10 @@ _COUNT_TOKENS_MSG = (
     "count_tokens is not available for Fable models — the backend is a human, so "
     "token accounting is undefined. Count against a real model instead."
 )
+_BETA_MSG = (
+    "Fable models are not available via the beta messages resource — route them "
+    "through client.messages.create() so they reach the human backend."
+)
 
 
 class _RoutedResponseProxy:
@@ -38,6 +42,60 @@ class _RoutedResponseProxy:
         if is_fable_model(kwargs.get("model"), self._fable_models):
             raise NotImplementedError(_RAW_MSG)
         return self._real.create(**kwargs)
+
+    def count_tokens(self, **kwargs):
+        if is_fable_model(kwargs.get("model"), self._fable_models):
+            raise NotImplementedError(_RAW_MSG)
+        return self._real.count_tokens(**kwargs)
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._real, name)
+
+
+class _BetaMessages:
+    """Guards the beta messages resource so Fable models can't bypass to the real API.
+
+    Fable on a beta surface is rejected (rather than routed to the human) because the
+    beta wire shapes aren't modelled here; everything non-Fable delegates unchanged.
+    """
+
+    def __init__(self, real_beta_messages, fable_models):
+        self._real = real_beta_messages
+        self._fable_models = fable_models
+
+    def create(self, **kwargs):
+        if is_fable_model(kwargs.get("model"), self._fable_models):
+            raise FableMeatError(_BETA_MSG)
+        return self._real.create(**kwargs)
+
+    def stream(self, **kwargs):
+        if is_fable_model(kwargs.get("model"), self._fable_models):
+            raise FableMeatError(_BETA_MSG)
+        return self._real.stream(**kwargs)
+
+    def count_tokens(self, **kwargs):
+        if is_fable_model(kwargs.get("model"), self._fable_models):
+            raise FableMeatError(_BETA_MSG)
+        return self._real.count_tokens(**kwargs)
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._real, name)
+
+
+class _BetaProxy:
+    """Wraps ``client.beta`` so its ``.messages`` surface is Fable-guarded."""
+
+    def __init__(self, real_beta, fable_models):
+        self._real = real_beta
+        self._fable_models = fable_models
+
+    @property
+    def messages(self):
+        return _BetaMessages(self._real.messages, self._fable_models)
 
     def __getattr__(self, name):
         if name.startswith("_"):
@@ -133,10 +191,13 @@ class _BaseProxy:
     _real: object
 
     def __getattr__(self, name):
-        # Anything we don't override (.models, .beta, …) falls through to the real
-        # client. Guard against recursion before _real is set.
+        # Anything we don't override (.models, …) falls through to the real client.
+        # Guard against recursion before _real is set.
         if name.startswith("_"):
             raise AttributeError(name)
+        if name == "beta":
+            # Wrap rather than delegate, so beta.messages can't bypass Fable routing.
+            return _BetaProxy(self._real.beta, self._fable_models)
         return getattr(self._real, name)
 
     def with_options(self, **kwargs):
@@ -187,6 +248,10 @@ class Anthropic(_BaseProxy):
         return self._gmail_service
 
     def _complete_via_meat(self, **kwargs):
+        # The reply token and correlation id are server-internal; never let a caller
+        # supply (and thereby weaken or predict) them through messages.create kwargs.
+        kwargs.pop("reply_token", None)
+        kwargs.pop("corr_id", None)
         config = self._config or Config.from_env()
         return complete_via_meat(config, self._ensure_service(config), **kwargs)
 
@@ -217,6 +282,8 @@ class AsyncAnthropic(_BaseProxy):
         self.messages = _AsyncMessages(self)
 
     async def _complete_via_meat(self, **kwargs):
+        kwargs.pop("reply_token", None)
+        kwargs.pop("corr_id", None)
         config = self._config or Config.from_env()
         if self._gmail_service is None:
             from .gmail_transport import build_service
