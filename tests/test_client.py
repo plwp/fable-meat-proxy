@@ -1,7 +1,8 @@
 import pytest
-from conftest import FakeGmailService, make_message
+from conftest import AutoReplyGmailService
 
 from fable_meat_proxy import Anthropic, Config, is_fable_model
+from fable_meat_proxy.errors import FableMeatError
 
 
 class FakeRawResponse:
@@ -47,11 +48,27 @@ def _config():
     return Config(friend_email="hank@example.com", poll_interval=0, reply_timeout_seconds=100)
 
 
-def test_is_fable_model():
+def test_is_fable_model_is_exact_not_substring():
     assert is_fable_model("claude-fable-5")
-    assert is_fable_model("Fable")
+    assert is_fable_model("CLAUDE-FABLE-5")  # case-insensitive
     assert not is_fable_model("claude-opus-4-8")
     assert not is_fable_model(None)
+    # Substring matches must NOT route to the human backend (prompt-exfil guard).
+    assert not is_fable_model("Fable")
+    assert not is_fable_model("not-fable")
+    assert not is_fable_model("claude-opus-4-fable-debug")
+
+
+def test_is_fable_model_custom_allowlist():
+    allow = frozenset({"my-fable", "claude-fable-5"})
+    assert is_fable_model("my-fable", allow)
+    assert not is_fable_model("claude-fable-5x", allow)
+
+
+def test_fable_count_tokens_rejected():
+    client = Anthropic(real_client=FakeRealClient(), config=_config())
+    with pytest.raises(FableMeatError):
+        client.messages.count_tokens(model="claude-fable-5", messages=[])
 
 
 def test_non_fable_passes_through_to_real_client():
@@ -93,9 +110,7 @@ def test_fable_create_stream_true_rejected():
 
 
 def test_with_options_preserves_proxy_and_routing():
-    own = make_message("sent-1", "Me <me@example.com>", "prompt")
-    reply = make_message("r1", "Hank <hank@example.com>", "options answer")
-    service = FakeGmailService([[own], [own, reply]])
+    service = AutoReplyGmailService(answer="options answer")
     real = FakeRealClient()
     client = Anthropic(real_client=real, config=_config(), gmail_service=service)
 
@@ -120,9 +135,7 @@ def test_raw_response_rejects_fable_but_delegates_others():
 
 
 def test_fable_routes_to_meat_and_returns_message():
-    own = make_message("sent-1", "Me <me@example.com>", "prompt")
-    reply = make_message("r1", "Hank <hank@example.com>", "the meaty answer")
-    service = FakeGmailService([[own], [own, reply]])
+    service = AutoReplyGmailService(answer="the meaty answer")
     real = FakeRealClient()
 
     client = Anthropic(real_client=real, config=_config(), gmail_service=service)

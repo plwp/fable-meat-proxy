@@ -17,10 +17,37 @@ except ImportError:  # pragma: no cover - dotenv is a declared dep
 
 logger = logging.getLogger("fable_meat_proxy")
 
+# Models routed to the human backend. An *exact* (case-insensitive) allowlist —
+# never a substring test: "claude-opus-4-fable-debug" or a caller-supplied
+# "not-fable" must NOT divert a private prompt to your friend's inbox.
+DEFAULT_FABLE_MODELS = frozenset({"claude-fable-5"})
 
-def is_fable_model(model: str | None) -> bool:
-    """A model is served by the meat proxy iff its name mentions Fable."""
-    return bool(model) and "fable" in model.lower()
+# Polling faster than this in production just burns Gmail quota for no benefit —
+# a human reply takes minutes at best. Direct Config(...) construction may still
+# pass a smaller value (tests inject a fake sleep); only from_env() clamps.
+MIN_POLL_INTERVAL_SECONDS = 5.0
+
+
+def fable_models_from_env() -> frozenset[str]:
+    """Resolve the Fable model allowlist from ``FABLE_MODELS`` (comma-separated)."""
+    raw = os.environ.get("FABLE_MODELS")
+    if not raw:
+        return DEFAULT_FABLE_MODELS
+    models = frozenset(m.strip().lower() for m in raw.split(",") if m.strip())
+    return models or DEFAULT_FABLE_MODELS
+
+
+def is_fable_model(model: str | None, models: frozenset[str] | None = None) -> bool:
+    """A model is served by the meat proxy iff it is in the exact allowlist.
+
+    ``models`` defaults to :data:`DEFAULT_FABLE_MODELS`. Matching is exact and
+    case-insensitive — substring matches are deliberately rejected so an
+    untrusted model string cannot reroute traffic to the human/email backend.
+    """
+    if not model:
+        return False
+    allow = DEFAULT_FABLE_MODELS if models is None else models
+    return model.lower() in {m.lower() for m in allow}
 
 
 def _env_float(name: str, default: float) -> float:
@@ -51,6 +78,7 @@ class Config:
     reply_timeout_business_days: float = 7.0
     reply_timeout_seconds: float | None = None
     poll_interval: float = 120.0
+    fable_models: frozenset[str] = DEFAULT_FABLE_MODELS
 
     def __post_init__(self) -> None:
         if not self.friend_email or "@" not in self.friend_email:
@@ -73,6 +101,15 @@ class Config:
                 "inbox (see .env.example)."
             )
         seconds_override = os.environ.get("FABLE_REPLY_TIMEOUT_SECONDS")
+        poll_interval = _env_float("FABLE_POLL_INTERVAL", 120.0)
+        if 0 <= poll_interval < MIN_POLL_INTERVAL_SECONDS:
+            logger.warning(
+                "FABLE_POLL_INTERVAL=%s is below the %ss minimum; clamping to avoid "
+                "busy-polling Gmail.",
+                poll_interval,
+                MIN_POLL_INTERVAL_SECONDS,
+            )
+            poll_interval = MIN_POLL_INTERVAL_SECONDS
         return cls(
             friend_email=friend,
             sender_email=os.environ.get("FABLE_SENDER_EMAIL", "me"),
@@ -85,5 +122,6 @@ class Config:
                 if seconds_override not in (None, "")
                 else None
             ),
-            poll_interval=_env_float("FABLE_POLL_INTERVAL", 120.0),
+            poll_interval=poll_interval,
+            fable_models=fable_models_from_env(),
         )

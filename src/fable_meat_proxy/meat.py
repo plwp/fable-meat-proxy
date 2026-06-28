@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import time
 import uuid
 
@@ -49,9 +50,14 @@ def build_message(model: str, text: str, corr: str, *, input_tokens: int = 0, ou
         )
 
 
-def _prepare(config: Config, model, messages, system, max_tokens, corr_id, now_ts, extra_params):
+def _prepare(
+    config: Config, model, messages, system, max_tokens, corr_id, now_ts, extra_params,
+    reply_token=None,
+):
     """Shared setup for the sync and async paths."""
     corr = corr_id or uuid.uuid4().hex[:8]
+    # Unguessable per-request secret used to authenticate the human's reply.
+    token = reply_token or secrets.token_urlsafe(18)
     subject = f"[{config.subject_prefix} {corr}] {first_user_snippet(messages)}"
     body = format_prompt_email(
         model=model,
@@ -60,10 +66,14 @@ def _prepare(config: Config, model, messages, system, max_tokens, corr_id, now_t
         max_tokens=max_tokens,
         corr_id=corr,
         extra_params=extra_params,
+        reply_token=token,
     )
+    # The token also rides in the Message-ID so a properly-threaded reply echoes it
+    # via In-Reply-To/References even if the human strips the quoted body.
+    message_id = f"<fable.{token}@fable-meat-proxy.invalid>"
     deadline_ts = deadline_ts_from_config(config, now_ts)
     logger.info("Routing model %r to meat proxy (corr %s)", model, corr)
-    return corr, subject, body, deadline_ts
+    return corr, subject, body, deadline_ts, token, message_id
 
 
 def complete_via_meat(
@@ -75,15 +85,20 @@ def complete_via_meat(
     system=None,
     max_tokens=None,
     corr_id: str | None = None,
+    reply_token: str | None = None,
     sleep=time.sleep,
     now=time.time,
     **extra_params,
 ):
     """Email the prompt to the friend, block for their reply, return a Message."""
-    corr, subject, body, deadline_ts = _prepare(
-        config, model, messages, system, max_tokens, corr_id, now(), extra_params
+    corr, subject, body, deadline_ts, token, message_id = _prepare(
+        config, model, messages, system, max_tokens, corr_id, now(), extra_params,
+        reply_token=reply_token,
     )
-    sent = send_message(service, config.friend_email, subject, body, sender=config.sender_email)
+    sent = send_message(
+        service, config.friend_email, subject, body,
+        sender=config.sender_email, message_id=message_id,
+    )
     reply = wait_for_reply(
         service,
         sent["threadId"],
@@ -91,6 +106,7 @@ def complete_via_meat(
         friend_email=config.friend_email,
         deadline_ts=deadline_ts,
         poll_interval=config.poll_interval,
+        reply_token=token,
         sleep=sleep,
         now=now,
     )
@@ -106,24 +122,29 @@ async def complete_via_meat_async(
     system=None,
     max_tokens=None,
     corr_id: str | None = None,
+    reply_token: str | None = None,
     sleep=asyncio.sleep,
     now=time.time,
     lock=None,
     **extra_params,
 ):
     """Async variant of :func:`complete_via_meat`."""
-    corr, subject, body, deadline_ts = _prepare(
-        config, model, messages, system, max_tokens, corr_id, now(), extra_params
+    corr, subject, body, deadline_ts, token, message_id = _prepare(
+        config, model, messages, system, max_tokens, corr_id, now(), extra_params,
+        reply_token=reply_token,
     )
+
+    def _send():
+        return send_message(
+            service, config.friend_email, subject, body,
+            config.sender_email, message_id,
+        )
+
     if lock is not None:
         async with lock:
-            sent = await asyncio.to_thread(
-                send_message, service, config.friend_email, subject, body, config.sender_email
-            )
+            sent = await asyncio.to_thread(_send)
     else:
-        sent = await asyncio.to_thread(
-            send_message, service, config.friend_email, subject, body, config.sender_email
-        )
+        sent = await asyncio.to_thread(_send)
     reply = await wait_for_reply_async(
         service,
         sent["threadId"],
@@ -131,6 +152,7 @@ async def complete_via_meat_async(
         friend_email=config.friend_email,
         deadline_ts=deadline_ts,
         poll_interval=config.poll_interval,
+        reply_token=token,
         sleep=sleep,
         now=now,
         lock=lock,
