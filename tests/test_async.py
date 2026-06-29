@@ -1,6 +1,6 @@
 import asyncio
 
-from conftest import FakeGmailService, make_message
+from conftest import AutoReplyGmailService
 
 from fable_meat_proxy import AsyncAnthropic, Config
 
@@ -31,9 +31,7 @@ def test_async_non_fable_passes_through():
 
 
 def test_async_fable_routes_to_meat():
-    own = make_message("sent-1", "Me <me@example.com>", "prompt")
-    reply = make_message("r1", "Hank <hank@example.com>", "async meaty answer")
-    service = FakeGmailService([[own], [own, reply]])
+    service = AutoReplyGmailService(answer="async meaty answer")
     real = FakeAsyncRealClient()
 
     client = AsyncAnthropic(real_client=real, config=_config(), gmail_service=service)

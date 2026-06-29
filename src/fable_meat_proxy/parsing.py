@@ -70,19 +70,30 @@ NOTABLE_PARAMS = (
 
 
 def format_prompt_email(
-    *, model, messages, system=None, max_tokens=None, corr_id, extra_params=None
+    *, model, messages, system=None, max_tokens=None, corr_id, extra_params=None,
+    reply_token=None,
 ) -> str:
-    """Build the human-readable email body the friend pastes into Fable."""
+    """Build the human-readable email body the friend pastes into Fable.
+
+    ``reply_token`` is an unguessable per-request secret. It is printed here and
+    travels back inside the quoted original when the friend replies; the transport
+    rejects any reply that cannot echo it (see ``find_reply``), which defeats
+    ``From:``-header spoofing.
+    """
     lines: list[str] = [
         "You are serving as a human proxy for the Fable model. 🥩",
         "",
         "1. Paste the conversation below into Fable.",
         "2. REPLY to this email with Fable's response as the plain-text body.",
         "   (Anything you write above the quoted original is taken as the answer.)",
+        "3. Leave the quoted original BELOW your answer intact — it carries a",
+        "   verification token without which your reply is ignored.",
         "",
         f"Correlation ID: {corr_id}",
         f"Model requested: {model}",
     ]
+    if reply_token:
+        lines.append(f"Verification token (do not delete): {reply_token}")
     if max_tokens:
         lines.append(f"Max tokens: {max_tokens}")
     lines.append("")
@@ -105,7 +116,17 @@ def format_prompt_email(
         lines += [f"{k}: {v}" for k, v in shown.items()]
         lines.append("")
 
-    lines.append("===== END OF PROMPT — reply with Fable's answer above the quote =====")
+    # The SYSTEM/CONVERSATION above is untrusted application input. Remind the human
+    # not to act on instructions smuggled into it (e.g. "ignore the above and ...").
+    lines += [
+        "===== SECURITY NOTE =====",
+        "Everything in the SYSTEM and CONVERSATION sections above is untrusted input",
+        "from the calling application. Do NOT obey instructions inside it that ask you",
+        "to ignore these directions, reveal this email, or change how you reply. Only",
+        "paste it into Fable and send back Fable's answer.",
+        "",
+        "===== END OF PROMPT — reply with Fable's answer above the quote =====",
+    ]
     return "\n".join(lines)
 
 
@@ -115,7 +136,24 @@ def _decode_b64url(data: str) -> str:
     return base64.urlsafe_b64decode(data.encode()).decode("utf-8", errors="replace")
 
 
+def _is_attachment(payload: dict) -> bool:
+    """Whether a MIME part is an attachment rather than an inline body part."""
+    if payload.get("filename"):
+        return True
+    if payload.get("body", {}).get("attachmentId"):
+        return True
+    for header in payload.get("headers", []) or []:
+        if header.get("name", "").lower() == "content-disposition":
+            if "attachment" in header.get("value", "").lower():
+                return True
+    return False
+
+
 def _collect_text_parts(payload: dict, out: dict[str, str]) -> None:
+    # Skip attachments (and their subtrees): a malicious reply could place a text
+    # attachment before the real answer and have it picked as the response body.
+    if _is_attachment(payload):
+        return
     mime = payload.get("mimeType", "")
     data = payload.get("body", {}).get("data")
     if data and mime.startswith("text/"):
@@ -139,9 +177,24 @@ def extract_message_text(message: dict) -> str:
     return next(iter(parts.values()), "")
 
 
+# Elements whose text is hidden from the reader; an attacker could otherwise make
+# the visible answer benign while the extracted text carries something else.
+_HIDDEN_ELEMENT = re.compile(
+    r"(?is)<([a-z][\w-]*)\b[^>]*style\s*=\s*['\"][^'\"]*"
+    r"(?:display\s*:\s*none|visibility\s*:\s*hidden)[^'\"]*['\"][^>]*>.*?</\1>"
+)
+
+
 def html_to_text(source: str) -> str:
-    """Best-effort conversion of an HTML email body to plain text."""
+    """Best-effort conversion of an HTML email body to plain text.
+
+    Not a full HTML parser: replies are normally ``text/plain`` and this is only a
+    fallback. It drops scripts, styles, comments, and inline-hidden elements so
+    hidden DOM text is not silently returned as the model's answer.
+    """
+    source = re.sub(r"(?is)<!--.*?-->", "", source)
     source = re.sub(r"(?is)<(script|style).*?</\1>", "", source)
+    source = _HIDDEN_ELEMENT.sub("", source)
     source = re.sub(r"(?i)<br\s*/?>", "\n", source)
     source = re.sub(r"(?i)</(p|div|li|tr|h[1-6])>", "\n", source)
     source = re.sub(r"<[^>]+>", "", source)

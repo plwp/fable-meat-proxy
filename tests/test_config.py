@@ -1,6 +1,11 @@
 import pytest
 
 from fable_meat_proxy import Config
+from fable_meat_proxy.config import (
+    DEFAULT_FABLE_MODELS,
+    MIN_POLL_INTERVAL_SECONDS,
+    fable_models_from_env,
+)
 from fable_meat_proxy.errors import FableConfigError
 
 
@@ -44,3 +49,25 @@ def test_config_invalid_number_raises(monkeypatch):
     monkeypatch.setenv("FABLE_POLL_INTERVAL", "soon")
     with pytest.raises(FableConfigError):
         Config.from_env()
+
+
+def test_config_from_env_clamps_tiny_poll_interval(monkeypatch):
+    monkeypatch.setenv("FABLE_FRIEND_EMAIL", "hank@example.com")
+    monkeypatch.setenv("FABLE_POLL_INTERVAL", "0")
+    assert Config.from_env().poll_interval == MIN_POLL_INTERVAL_SECONDS
+
+
+def test_config_from_env_default_fable_models(monkeypatch):
+    monkeypatch.setenv("FABLE_FRIEND_EMAIL", "hank@example.com")
+    monkeypatch.delenv("FABLE_MODELS", raising=False)
+    assert Config.from_env().fable_models == DEFAULT_FABLE_MODELS
+
+
+def test_fable_models_from_env_parses_csv(monkeypatch):
+    monkeypatch.setenv("FABLE_MODELS", "Foo-Model, bar-model ,")
+    assert fable_models_from_env() == frozenset({"foo-model", "bar-model"})
+
+
+def test_fable_models_from_env_blank_falls_back(monkeypatch):
+    monkeypatch.setenv("FABLE_MODELS", "   ")
+    assert fable_models_from_env() == DEFAULT_FABLE_MODELS

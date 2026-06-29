@@ -6,6 +6,7 @@ import asyncio
 import base64
 import logging
 import os
+import stat
 import time
 from email.mime.text import MIMEText
 from email.utils import parseaddr
@@ -34,6 +35,9 @@ def build_service(config):
 
     creds = None
     if os.path.exists(config.token_path):
+        # The cached token holds a refresh token. Tighten perms before trusting a
+        # file that other accounts on the host may have been able to read.
+        _ensure_owner_only(config.token_path)
         creds = Credentials.from_authorized_user_file(config.token_path, SCOPES)
 
     if not creds or not creds.valid:
@@ -49,15 +53,66 @@ def build_service(config):
             logger.info("Running Gmail OAuth flow")
             flow = InstalledAppFlow.from_client_secrets_file(config.credentials_path, SCOPES)
             creds = flow.run_local_server(port=0)
-        with open(config.token_path, "w") as fh:
-            fh.write(creds.to_json())
-        # token.json is a secret (refresh token); keep it owner-only.
-        try:
-            os.chmod(config.token_path, 0o600)
-        except OSError:  # pragma: no cover - non-POSIX filesystems
-            logger.warning("Could not restrict permissions on %s", config.token_path)
+        # token.json is a secret; write it owner-only with no create→chmod race.
+        write_secret_file(config.token_path, creds.to_json())
 
     return build("gmail", "v1", credentials=creds)
+
+
+# O_NOFOLLOW makes open() refuse a symlink at the final path component, so a
+# pre-placed "token.json -> victim" symlink can't redirect our write or chmod.
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _ensure_owner_only(path: str) -> None:
+    """Tighten a secret file to 0600 if it is group/other-accessible.
+
+    Refuses to operate through a symlink (uses ``lstat`` to detect it and a
+    NOFOLLOW open to ``fchmod`` the real file) so a swapped symlink can't be used
+    to change a victim file's permissions.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:  # pragma: no cover - file vanished between checks
+        return
+    if stat.S_ISLNK(st.st_mode):
+        logger.warning("Refusing to trust token file %s: it is a symlink.", path)
+        return
+    if st.st_mode & 0o077:
+        logger.warning(
+            "Secret file %s was group/other-accessible (mode %o); tightening to 0600.",
+            path,
+            st.st_mode & 0o777,
+        )
+        try:
+            fd = os.open(path, os.O_RDONLY | _NOFOLLOW)
+        except OSError:  # pragma: no cover - replaced by a symlink between checks
+            logger.warning("Could not reopen %s to restrict permissions", path)
+            return
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:  # pragma: no cover - non-POSIX filesystems
+            logger.warning("Could not restrict permissions on %s", path)
+        finally:
+            os.close(fd)
+
+
+def write_secret_file(path: str, data: str) -> None:
+    """Write ``data`` with owner-only permissions, created atomically at 0600.
+
+    Uses O_NOFOLLOW so a pre-existing symlink at ``path`` is not followed, and
+    fchmod (on the open descriptor, not the path) so the perm change can't be
+    raced onto another file.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        # O_CREAT applies 0o600 only on creation; fchmod also covers a pre-existing
+        # regular file, whose perms O_CREAT would have left untouched.
+        try:
+            os.fchmod(fh.fileno(), 0o600)
+        except OSError:  # pragma: no cover - non-POSIX filesystems
+            logger.warning("Could not restrict permissions on %s", path)
+        fh.write(data)
 
 
 def _is_transient(exc: Exception) -> bool:
@@ -92,14 +147,24 @@ def execute_with_retry(thunk, *, retries: int = 4, base_delay: float = 1.0, slee
             sleep(delay)
 
 
-def send_message(service, to: str, subject: str, body: str, sender: str = "me") -> dict:
-    """Send a plain-text email; returns the sent message resource (with threadId)."""
+def send_message(
+    service, to: str, subject: str, body: str, sender: str = "me",
+    message_id: str | None = None,
+) -> dict:
+    """Send a plain-text email; returns the sent message resource (with threadId).
+
+    ``message_id`` sets the RFC822 ``Message-ID`` header. When it embeds the reply
+    token, a properly-threaded reply echoes the token in its ``In-Reply-To`` /
+    ``References`` headers — a second carrier alongside the quoted body.
+    """
     msg = MIMEText(body)
     msg["to"] = to
     # "me" is a Gmail API placeholder, not a valid address — let Gmail fill From.
     if sender and sender != "me":
         msg["from"] = sender
     msg["subject"] = subject
+    if message_id:
+        msg["Message-ID"] = message_id
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     result = execute_with_retry(
         lambda: service.users().messages().send(userId="me", body={"raw": raw}).execute()
@@ -123,23 +188,51 @@ def get_header(message: dict, name: str) -> str:
     return ""
 
 
-def find_reply(messages: list[dict], exclude_id: str | None, friend_email: str) -> str | None:
+def _references_blob(message: dict) -> str:
+    return " ".join(get_header(message, h) for h in ("In-Reply-To", "References"))
+
+
+def _proves_receipt(message: dict, full_text: str, reply_token: str) -> bool:
+    """Whether a candidate reply demonstrates it actually received our email.
+
+    The token is unguessable and only ever lands in the friend's inbox, so an
+    attacker forging ``From: friend`` cannot reproduce it. It rides back either in
+    the quoted original body or in the threading headers (Message-ID we sent).
+    """
+    return reply_token in full_text or reply_token in _references_blob(message)
+
+
+def find_reply(
+    messages: list[dict], exclude_id: str | None, friend_email: str,
+    *, reply_token: str | None = None,
+) -> str | None:
     """Return the friend's latest reply text from a thread, or None if none yet.
 
     Matches the friend by *exact* parsed address (display names and substrings do
-    not count) and returns the most recent qualifying message, since Gmail returns
-    thread messages in chronological order.
+    not count). When ``reply_token`` is given, a candidate must also prove receipt
+    of our email (echo the token) — ``From:`` alone is spoofable, so without this
+    an attacker who lands a message in the thread could impersonate the friend.
+    Returns the most recent qualifying message (Gmail orders threads chronologically).
     """
     target = friend_email.strip().lower()
-    latest = None
+    chosen_text = None
     for message in messages:
         if message.get("id") == exclude_id:
             continue
-        if parseaddr(get_header(message, "From"))[1].lower() == target:
-            latest = message
-    if latest is None:
+        if parseaddr(get_header(message, "From"))[1].lower() != target:
+            continue
+        full_text = extract_message_text(message)
+        if reply_token is not None and not _proves_receipt(message, full_text, reply_token):
+            logger.warning(
+                "Discarding a thread message that claims to be from %s but lacks the "
+                "verification token (possible spoofed reply).",
+                target,
+            )
+            continue
+        chosen_text = full_text
+    if chosen_text is None:
         return None
-    return strip_quoted_reply(extract_message_text(latest))
+    return strip_quoted_reply(chosen_text)
 
 
 def _timeout_error(friend_email: str, thread_id: str) -> FableReplyTimeout:
@@ -161,12 +254,16 @@ def wait_for_reply(
     friend_email: str,
     deadline_ts: float,
     poll_interval: float,
+    reply_token: str | None = None,
     sleep=time.sleep,
     now=time.time,
 ) -> str:
     """Block until the friend replies in the thread, then return their text."""
     while True:
-        text = find_reply(get_thread_messages(service, thread_id), exclude_id, friend_email)
+        text = find_reply(
+            get_thread_messages(service, thread_id), exclude_id, friend_email,
+            reply_token=reply_token,
+        )
         if text is not None:
             logger.info("Received Fable reply on thread %s", thread_id)
             return text
@@ -185,6 +282,7 @@ async def wait_for_reply_async(
     friend_email: str,
     deadline_ts: float,
     poll_interval: float,
+    reply_token: str | None = None,
     sleep=asyncio.sleep,
     now=time.time,
     lock=None,
@@ -202,7 +300,7 @@ async def wait_for_reply_async(
             return await asyncio.to_thread(get_thread_messages, service, thread_id)
 
     while True:
-        text = find_reply(await _poll(), exclude_id, friend_email)
+        text = find_reply(await _poll(), exclude_id, friend_email, reply_token=reply_token)
         if text is not None:
             logger.info("Received Fable reply on thread %s", thread_id)
             return text

@@ -135,3 +135,48 @@ def test_extract_message_text_unpadded_base64():
 def test_html_to_text_strips_tags_and_scripts():
     html = "<style>x{}</style><p>Para one</p><p>Para &amp; two<br>line</p>"
     assert html_to_text(html) == "Para one\nPara & two\nline"
+
+
+def test_html_to_text_drops_comments_and_hidden_text():
+    html = (
+        "<p>visible answer</p>"
+        "<!-- secret comment -->"
+        "<span style=\"display:none\">HIDDEN INJECTION</span>"
+        "<div style='visibility:hidden'>also hidden</div>"
+    )
+    out = html_to_text(html)
+    assert "visible answer" in out
+    assert "HIDDEN" not in out
+    assert "secret comment" not in out
+    assert "also hidden" not in out
+
+
+def test_extract_message_text_skips_attachment_parts():
+    # A text/plain attachment placed before the real body must not be chosen.
+    msg = {
+        "payload": {
+            "mimeType": "multipart/mixed",
+            "parts": [
+                {
+                    "mimeType": "text/plain",
+                    "filename": "evil.txt",
+                    "headers": [{"name": "Content-Disposition", "value": "attachment; filename=evil.txt"}],
+                    "body": {"data": b64("ATTACKER CONTROLLED")},
+                },
+                {"mimeType": "text/plain", "body": {"data": b64("the genuine reply")}},
+            ],
+        }
+    }
+    assert extract_message_text(msg) == "the genuine reply"
+
+
+def test_format_prompt_email_includes_reply_token_and_security_note():
+    body = format_prompt_email(
+        model="claude-fable-5",
+        messages=[{"role": "user", "content": "hi"}],
+        corr_id="abc",
+        reply_token="TOK-123",
+    )
+    assert "TOK-123" in body
+    assert "untrusted input" in body
+    assert "SECURITY NOTE" in body

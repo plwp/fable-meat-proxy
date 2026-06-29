@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
-from .config import Config, is_fable_model
+from .config import Config, fable_models_from_env, is_fable_model
+from .errors import FableMeatError
 from .meat import complete_via_meat, complete_via_meat_async
 
 _STREAM_MSG = (
@@ -16,6 +17,14 @@ _RAW_MSG = (
     "(they return wire-level responses a human reply can't satisfy). Use "
     "messages.create() for Fable models."
 )
+_COUNT_TOKENS_MSG = (
+    "count_tokens is not available for Fable models — the backend is a human, so "
+    "token accounting is undefined. Count against a real model instead."
+)
+_BETA_MSG = (
+    "Fable models are not available via the beta messages resource — route them "
+    "through client.messages.create() so they reach the human backend."
+)
 
 
 class _RoutedResponseProxy:
@@ -25,13 +34,68 @@ class _RoutedResponseProxy:
     silently bypassing the meat proxy and hitting the real API.
     """
 
-    def __init__(self, real_wrapper):
+    def __init__(self, real_wrapper, fable_models):
         self._real = real_wrapper
+        self._fable_models = fable_models
 
     def create(self, **kwargs):
-        if is_fable_model(kwargs.get("model")):
+        if is_fable_model(kwargs.get("model"), self._fable_models):
             raise NotImplementedError(_RAW_MSG)
         return self._real.create(**kwargs)
+
+    def count_tokens(self, **kwargs):
+        if is_fable_model(kwargs.get("model"), self._fable_models):
+            raise NotImplementedError(_RAW_MSG)
+        return self._real.count_tokens(**kwargs)
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._real, name)
+
+
+class _BetaMessages:
+    """Guards the beta messages resource so Fable models can't bypass to the real API.
+
+    Fable on a beta surface is rejected (rather than routed to the human) because the
+    beta wire shapes aren't modelled here; everything non-Fable delegates unchanged.
+    """
+
+    def __init__(self, real_beta_messages, fable_models):
+        self._real = real_beta_messages
+        self._fable_models = fable_models
+
+    def create(self, **kwargs):
+        if is_fable_model(kwargs.get("model"), self._fable_models):
+            raise FableMeatError(_BETA_MSG)
+        return self._real.create(**kwargs)
+
+    def stream(self, **kwargs):
+        if is_fable_model(kwargs.get("model"), self._fable_models):
+            raise FableMeatError(_BETA_MSG)
+        return self._real.stream(**kwargs)
+
+    def count_tokens(self, **kwargs):
+        if is_fable_model(kwargs.get("model"), self._fable_models):
+            raise FableMeatError(_BETA_MSG)
+        return self._real.count_tokens(**kwargs)
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._real, name)
+
+
+class _BetaProxy:
+    """Wraps ``client.beta`` so its ``.messages`` surface is Fable-guarded."""
+
+    def __init__(self, real_beta, fable_models):
+        self._real = real_beta
+        self._fable_models = fable_models
+
+    @property
+    def messages(self):
+        return _BetaMessages(self._real.messages, self._fable_models)
 
     def __getattr__(self, name):
         if name.startswith("_"):
@@ -46,28 +110,39 @@ class _Messages:
         self._proxy = proxy
 
     def create(self, **kwargs):
-        if is_fable_model(kwargs.get("model")):
+        if is_fable_model(kwargs.get("model"), self._proxy._fable_models):
             if kwargs.get("stream"):
                 raise NotImplementedError(_STREAM_MSG)
             return self._proxy._complete_via_meat(**kwargs)
         return self._proxy._real.messages.create(**kwargs)
 
     def stream(self, **kwargs):
-        if is_fable_model(kwargs.get("model")):
+        if is_fable_model(kwargs.get("model"), self._proxy._fable_models):
             raise NotImplementedError(_STREAM_MSG)
         return self._proxy._real.messages.stream(**kwargs)
 
+    def count_tokens(self, **kwargs):
+        # A human reply has no meaningful token count; reject rather than silently
+        # forwarding a Fable model to the real token counter.
+        if is_fable_model(kwargs.get("model"), self._proxy._fable_models):
+            raise FableMeatError(_COUNT_TOKENS_MSG)
+        return self._proxy._real.messages.count_tokens(**kwargs)
+
     @property
     def with_raw_response(self):
-        return _RoutedResponseProxy(self._proxy._real.messages.with_raw_response)
+        return _RoutedResponseProxy(
+            self._proxy._real.messages.with_raw_response, self._proxy._fable_models
+        )
 
     @property
     def with_streaming_response(self):
-        return _RoutedResponseProxy(self._proxy._real.messages.with_streaming_response)
+        return _RoutedResponseProxy(
+            self._proxy._real.messages.with_streaming_response, self._proxy._fable_models
+        )
 
     def __getattr__(self, name):
-        # count_tokens, batches, … fall through to the real messages resource.
-        # (Fable routing only applies to create()/stream() and the response wrappers.)
+        # batches, … fall through to the real messages resource. (Fable routing
+        # applies to create()/stream()/count_tokens() and the response wrappers.)
         if name.startswith("_"):
             raise AttributeError(name)
         return getattr(self._proxy._real.messages, name)
@@ -78,24 +153,33 @@ class _AsyncMessages:
         self._proxy = proxy
 
     async def create(self, **kwargs):
-        if is_fable_model(kwargs.get("model")):
+        if is_fable_model(kwargs.get("model"), self._proxy._fable_models):
             if kwargs.get("stream"):
                 raise NotImplementedError(_STREAM_MSG)
             return await self._proxy._complete_via_meat(**kwargs)
         return await self._proxy._real.messages.create(**kwargs)
 
     def stream(self, **kwargs):
-        if is_fable_model(kwargs.get("model")):
+        if is_fable_model(kwargs.get("model"), self._proxy._fable_models):
             raise NotImplementedError(_STREAM_MSG)
         return self._proxy._real.messages.stream(**kwargs)
 
+    async def count_tokens(self, **kwargs):
+        if is_fable_model(kwargs.get("model"), self._proxy._fable_models):
+            raise FableMeatError(_COUNT_TOKENS_MSG)
+        return await self._proxy._real.messages.count_tokens(**kwargs)
+
     @property
     def with_raw_response(self):
-        return _RoutedResponseProxy(self._proxy._real.messages.with_raw_response)
+        return _RoutedResponseProxy(
+            self._proxy._real.messages.with_raw_response, self._proxy._fable_models
+        )
 
     @property
     def with_streaming_response(self):
-        return _RoutedResponseProxy(self._proxy._real.messages.with_streaming_response)
+        return _RoutedResponseProxy(
+            self._proxy._real.messages.with_streaming_response, self._proxy._fable_models
+        )
 
     def __getattr__(self, name):
         if name.startswith("_"):
@@ -107,10 +191,13 @@ class _BaseProxy:
     _real: object
 
     def __getattr__(self, name):
-        # Anything we don't override (.models, .beta, …) falls through to the real
-        # client. Guard against recursion before _real is set.
+        # Anything we don't override (.models, …) falls through to the real client.
+        # Guard against recursion before _real is set.
         if name.startswith("_"):
             raise AttributeError(name)
+        if name == "beta":
+            # Wrap rather than delegate, so beta.messages can't bypass Fable routing.
+            return _BetaProxy(self._real.beta, self._fable_models)
         return getattr(self._real, name)
 
     def with_options(self, **kwargs):
@@ -127,8 +214,9 @@ class Anthropic(_BaseProxy):
     """Passthrough Anthropic client.
 
     Every non-Fable model is delegated, unchanged, to the real ``anthropic.Anthropic``
-    client. ``model="claude-fable-5"`` (anything containing "fable") is instead routed
-    to a human over email and blocks until they reply.
+    client. A model in the Fable allowlist (``{"claude-fable-5"}`` by default; override
+    via ``FABLE_MODELS`` or ``Config.fable_models``) is instead routed to a human over
+    email and blocks until they reply. Matching is exact, never a substring.
     """
 
     def __init__(
@@ -147,6 +235,9 @@ class Anthropic(_BaseProxy):
             self._real = _RealAnthropic(*args, **kwargs)
         self._config = config
         self._gmail_service = gmail_service
+        # Routing must be decided on every create() without building a full Config
+        # (which needs friend_email). Resolve the allowlist eagerly from config or env.
+        self._fable_models = config.fable_models if config is not None else fable_models_from_env()
         self.messages = _Messages(self)
 
     def _ensure_service(self, config: Config):
@@ -157,6 +248,10 @@ class Anthropic(_BaseProxy):
         return self._gmail_service
 
     def _complete_via_meat(self, **kwargs):
+        # The reply token and correlation id are server-internal; never let a caller
+        # supply (and thereby weaken or predict) them through messages.create kwargs.
+        kwargs.pop("reply_token", None)
+        kwargs.pop("corr_id", None)
         config = self._config or Config.from_env()
         return complete_via_meat(config, self._ensure_service(config), **kwargs)
 
@@ -180,12 +275,15 @@ class AsyncAnthropic(_BaseProxy):
             self._real = _RealAsyncAnthropic(*args, **kwargs)
         self._config = config
         self._gmail_service = gmail_service
+        self._fable_models = config.fable_models if config is not None else fable_models_from_env()
         # Serializes access to the shared, not-thread-safe Gmail service across
         # concurrent Fable requests.
         self._gmail_lock = asyncio.Lock()
         self.messages = _AsyncMessages(self)
 
     async def _complete_via_meat(self, **kwargs):
+        kwargs.pop("reply_token", None)
+        kwargs.pop("corr_id", None)
         config = self._config or Config.from_env()
         if self._gmail_service is None:
             from .gmail_transport import build_service

@@ -6,6 +6,38 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Security (red-team hardening)
+- **Reply authentication.** Each Fable request now carries an unguessable token in
+  the email body and `Message-ID`. A reply is accepted only if it echoes the token
+  (via the quoted original or `In-Reply-To`/`References`), so a forged `From: friend`
+  header alone can no longer inject a response. (`find_reply`, `meat.py`, `parsing.py`)
+- **Exact model routing.** `is_fable_model` matches an exact, case-insensitive
+  allowlist (`{"claude-fable-5"}`, override via `FABLE_MODELS`) instead of a
+  substring test — `not-fable` or `claude-opus-4-fable-debug` no longer divert a
+  private prompt to the human/email backend.
+- **`count_tokens` for Fable models is rejected** rather than silently forwarded to
+  the real API (the backend is a human; token accounting is undefined).
+- **Token-file permissions.** `token.json` is created atomically at `0600` (no
+  create→chmod race) and an existing group/other-readable token is tightened before
+  it is trusted.
+- **Reply parsing hardening.** Attachment parts are skipped (a text attachment can
+  no longer masquerade as the answer); the HTML fallback drops comments and
+  inline-hidden (`display:none`/`visibility:hidden`) text.
+- **Prompt-injection note.** The outgoing email labels the conversation as untrusted
+  input and tells the human not to act on instructions embedded in it.
+- **Poll-interval floor.** `Config.from_env()` clamps `FABLE_POLL_INTERVAL` below
+  5 s to avoid busy-polling Gmail (direct `Config(...)` still allows 0 for tests).
+
+#### Follow-up (second red-team pass)
+- **`client.beta` no longer bypasses Fable routing.** `beta.messages.create` /
+  `stream` / `count_tokens` reject Fable models instead of reaching the real API.
+- **Token file is symlink-safe.** Writes use `O_NOFOLLOW` and `fchmod` on the open
+  descriptor; `_ensure_owner_only` refuses symlinks — closing the symlink/TOCTOU
+  vector on `token.json`.
+- **Caller-supplied `reply_token`/`corr_id` are stripped** in the client path, so a
+  weak or predictable token can't be injected through `messages.create` kwargs.
+- **`with_raw_response.count_tokens`** also rejects Fable models.
+
 ### Changed (code-review hardening)
 - `with_options(...)` now returns a proxy, so Fable routing survives chaining;
   `with_raw_response` / `with_streaming_response` reject Fable instead of silently

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import email as _email
 
 
 def b64(text: str) -> str:
@@ -13,11 +14,14 @@ def encode_part(text: str) -> dict:
     return {"mimeType": "text/plain", "body": {"data": b64(text)}}
 
 
-def make_message(msg_id: str, sender: str, text: str) -> dict:
+def make_message(msg_id: str, sender: str, text: str, *, headers: dict | None = None) -> dict:
+    hdrs = [{"name": "From", "value": sender}]
+    for name, value in (headers or {}).items():
+        hdrs.append({"name": name, "value": value})
     return {
         "id": msg_id,
         "payload": {
-            "headers": [{"name": "From", "value": sender}],
+            "headers": hdrs,
             **encode_part(text),
         },
     }
@@ -84,3 +88,79 @@ class FakeGmailService:
 
     def users(self):
         return _Users(self)
+
+
+class _AutoReplyMessages:
+    def __init__(self, service):
+        self._service = service
+
+    def send(self, userId, body):  # noqa: N803 - mirror Gmail API kwarg
+        self._service._on_send(body)
+        return _Execute({"id": "sent-1", "threadId": "thread-1"})
+
+    def getProfile(self, userId):  # noqa: N803
+        return _Execute({"emailAddress": "me@example.com"})
+
+
+class _AutoReplyThreads:
+    def __init__(self, service):
+        self._service = service
+
+    def get(self, userId, id, format):  # noqa: A002, N803 - mirror Gmail API
+        self._service.poll_count += 1
+        return _Execute({"messages": self._service._visible()})
+
+
+class _AutoReplyUsers:
+    def __init__(self, service):
+        self._service = service
+
+    def messages(self):
+        return _AutoReplyMessages(self._service)
+
+    def threads(self):
+        return _AutoReplyThreads(self._service)
+
+
+class AutoReplyGmailService:
+    """Models a friend who replies by quoting the original email, as a real client would.
+
+    On send() it decodes the outgoing message, then prepares a reply that places the
+    answer above the quoted original (which carries the verification token) and sets
+    In-Reply-To/References to the sent Message-ID. The reply appears on the second
+    poll. This exercises the transport's reply-authentication path end to end without
+    the token having to be known in advance.
+    """
+
+    def __init__(self, answer: str = "the meaty answer", friend: str = "hank@example.com"):
+        self.answer = answer
+        self.friend = friend
+        self.sent: list[dict] = []
+        self.poll_count = 0
+        self._sent_msg: dict | None = None
+        self._reply_msg: dict | None = None
+
+    def users(self):
+        return _AutoReplyUsers(self)
+
+    def _on_send(self, body: dict) -> None:
+        self.sent.append(body)
+        parsed = _email.message_from_bytes(base64.urlsafe_b64decode(body["raw"]))
+        original = parsed.get_payload(decode=True).decode()
+        message_id = parsed.get("Message-ID", "")
+        self._sent_msg = make_message("sent-1", "me@example.com", original)
+        quoted = "\n".join("> " + line for line in original.splitlines())
+        reply_body = f"{self.answer}\n\nOn Mon Jan 1 2026, me@example.com wrote:\n{quoted}"
+        self._reply_msg = make_message(
+            "reply-1",
+            f"Hank <{self.friend}>",
+            reply_body,
+            headers={"In-Reply-To": message_id, "References": message_id},
+        )
+
+    def _visible(self) -> list[dict]:
+        if self._sent_msg is None:
+            return []
+        if self.poll_count <= 1:
+            return [self._sent_msg]
+        return [self._sent_msg, self._reply_msg]
