@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-29
+
 ### Security (red-team hardening)
 - **Reply authentication.** Each Fable request now carries an unguessable token in
   the email body and `Message-ID`. A reply is accepted only if it echoes the token
@@ -68,5 +70,6 @@ All notable changes to this project are documented here. The format is based on
 - `fable-meat-auth` console script for the one-time Gmail OAuth flow.
 - Typed package (`py.typed`), CI (Python 3.11–3.13), and Trusted-Publishing release workflow.
 
-[Unreleased]: https://github.com/plwp/fable-meat-proxy/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/plwp/fable-meat-proxy/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/plwp/fable-meat-proxy/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/plwp/fable-meat-proxy/releases/tag/v0.1.0
